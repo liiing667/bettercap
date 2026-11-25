@@ -1,6 +1,7 @@
 package http_proxy
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -119,6 +120,72 @@ func TestRejectedHandshakeHasNoSuccessEvent(t *testing.T) {
 	for _, e := range sess.Events.Sorted() {
 		if msg, ok := e.Data.(session.LogMessage); ok && strings.Contains(msg.Message, "handshake established") {
 			t.Fatalf("premature success event: %s", msg.Message)
+		}
+	}
+}
+
+func TestWildcardCertificateIsNotCached(t *testing.T) {
+	sess, _ := createMockSession()
+	proxy := NewHTTPProxy(sess, "test")
+
+	// Port 1 on loopback is refused immediately, so SignCertificateForHost
+	// takes its offline fallback path and the test stays hermetic.
+	signer := proxy.TLSConfigFromCA(newTestCA(t, "wildcard test CA"))
+
+	leafDER := func(cfg *tls.Config) []byte {
+		t.Helper()
+		if len(cfg.Certificates) == 0 || len(cfg.Certificates[0].Certificate) == 0 {
+			t.Fatal("signed config carries no certificate")
+		}
+		return cfg.Certificates[0].Certificate[0]
+	}
+
+	// A concrete host is cached: both calls must return the same leaf.
+	firstConcrete, err := signer("concrete.example.com:1", nil)
+	if err != nil {
+		t.Fatalf("first concrete signing failed: %v", err)
+	}
+	secondConcrete, err := signer("concrete.example.com:1", nil)
+	if err != nil {
+		t.Fatalf("second concrete signing failed: %v", err)
+	}
+	if !bytes.Equal(leafDER(firstConcrete), leafDER(secondConcrete)) {
+		t.Fatal("concrete host certificates were not reused from the cache")
+	}
+
+	// IPs are concrete names too and keep being cached.
+	firstIP, err := signer("127.0.0.1:1", nil)
+	if err != nil {
+		t.Fatalf("first IP signing failed: %v", err)
+	}
+	secondIP, err := signer("127.0.0.1:1", nil)
+	if err != nil {
+		t.Fatalf("second IP signing failed: %v", err)
+	}
+	if !bytes.Equal(leafDER(firstIP), leafDER(secondIP)) {
+		t.Fatal("IP certificates were not reused from the cache")
+	}
+
+	// Wildcard names must never be cached: every connection gets a freshly
+	// signed leaf with its own key, so no two tenants share a certificate.
+	wildcardCerts := make(map[string]bool)
+	for i := 0; i < 3; i++ {
+		cfg, err := signer("*.shared.example.com:1", nil)
+		if err != nil {
+			t.Fatalf("wildcard signing %d failed: %v", i, err)
+		}
+		der := leafDER(cfg)
+		if wildcardCerts[string(der)] {
+			t.Fatalf("wildcard certificate reused on connection %d", i)
+		}
+		wildcardCerts[string(der)] = true
+
+		leaf, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatalf("parse wildcard leaf %d: %v", i, err)
+		}
+		if len(leaf.DNSNames) != 1 || leaf.DNSNames[0] != "*.shared.example.com" {
+			t.Fatalf("connection %d: wildcard SAN not preserved, got %v", i, leaf.DNSNames)
 		}
 	}
 }

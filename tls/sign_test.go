@@ -8,6 +8,33 @@ import (
 	"testing"
 )
 
+func TestIsWildcardHost(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		want bool
+	}{
+		{"wildcard", "*.example.com", true},
+		{"wildcard with port", "*.example.com:443", true},
+		{"bare wildcard label", "*", false},
+		{"wildcard not in leftmost label", "foo.*.com", false},
+		{"concrete host", "www.example.com", false},
+		{"single label host", "localhost", false},
+		{"ipv4", "127.0.0.1", false},
+		{"ipv4 with port", "127.0.0.1:8443", false},
+		{"ipv6", "2001:db8::1", false},
+		{"empty", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsWildcardHost(tt.host); got != tt.want {
+				t.Errorf("IsWildcardHost(%q) = %v, want %v", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
 // newTestCA returns a CA tls.Certificate whose Certificate chain contains
 // chainCerts certificates (the first one is the actual signing CA, the
 // remaining ones simulate upper intermediates loaded from the proxy

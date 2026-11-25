@@ -308,19 +308,34 @@ func (p *HTTPProxy) TLSConfigFromCA(ca *tls.Certificate) func(host string, ctx *
 		}
 
 		var cert *tls.Certificate
+		// A wildcard name (e.g. "*.example.com") can be requested by any
+		// tenant behind the proxy, so caching a certificate for it would hand
+		// every later tenant the same leaf certificate and private key. Sign
+		// a fresh certificate per connection instead; concrete hosts and IPs
+		// keep being cached as before.
+		wildcard := btls.IsWildcardHost(hostname)
 		cacheKey := fmt.Sprintf("%s:%d", hostname, port)
-		if cached, ok := certificates.Load(cacheKey); ok {
-			cert = cached.(*tls.Certificate)
-			p.Debug("serving spoofed certificate for %s:%d", tui.Yellow(hostname), port)
-		} else {
-			p.Info("creating spoofed certificate for %s:%d", tui.Yellow(hostname), port)
+		if !wildcard {
+			if cached, ok := certificates.Load(cacheKey); ok {
+				cert = cached.(*tls.Certificate)
+				p.Debug("serving spoofed certificate for %s:%d", tui.Yellow(hostname), port)
+			}
+		}
+		if cert == nil {
+			if wildcard {
+				p.Info("signing one-off spoofed certificate for wildcard host %s:%d (not cached)", tui.Yellow(hostname), port)
+			} else {
+				p.Info("creating spoofed certificate for %s:%d", tui.Yellow(hostname), port)
+			}
 			cert, err = btls.SignCertificateForHost(ca, hostname, port, leafBits)
 			if err != nil {
 				p.Warning("cannot sign host certificate with provided CA: %s", err)
 				return nil, err
 			}
 
-			certificates.Store(cacheKey, cert)
+			if !wildcard {
+				certificates.Store(cacheKey, cert)
+			}
 		}
 
 		config := tls.Config{

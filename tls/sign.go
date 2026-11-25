@@ -9,10 +9,31 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/bettercap/bettercap/v2/log"
 )
+
+// IsWildcardHost reports whether host is a DNS wildcard name rather than a
+// concrete hostname or IP. Wildcards are only legal in the leftmost label
+// (e.g. "*.example.com"); a literal "*" reached through SNI or a CONNECT
+// request matches every tenant sharing the proxy, so certificates signed for
+// such names must never be cached and reused across connections.
+func IsWildcardHost(host string) bool {
+	// SNI / CONNECT authority values carry no port, but tolerate one so the
+	// helper stays safe if callers pass a host:port pair.
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+
+	if host == "" || net.ParseIP(host) != nil {
+		return false
+	}
+
+	firstLabel, _, found := strings.Cut(host, ".")
+	return found && firstLabel == "*"
+}
 
 func getServerCertificate(host string, port int) *x509.Certificate {
 	log.Debug("Fetching TLS certificate from %s:%d ...", host, port)
