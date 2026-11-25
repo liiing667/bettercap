@@ -5,12 +5,14 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
-	"unsafe"
 )
 
 const (
+	ntlmSignature = "NTLMSSP\x00"
+
 	NTLM_SIG_OFFSET  = 0
 	NTLM_TYPE_OFFSET = 8
 
@@ -99,16 +101,28 @@ func (s *NTLMState) AddClientResponse(seq uint32, value string, cb func(data NTL
 	s.Lock()
 	defer s.Unlock()
 
-	if chall, found := s.Responses[seq]; found {
-		pair := NTLMChallengeResponse{
-			Challenge: chall,
-			Response:  value,
-		}
-		s.Pairs = append(s.Pairs, pair)
+	chall, found := s.Responses[seq]
+	if !found {
+		return
+	}
 
-		if data, err := pair.Parsed(); err == nil {
-			cb(data)
-		}
+	pair := NTLMChallengeResponse{
+		Challenge: chall,
+		Response:  value,
+	}
+
+	// Validate before publishing the pair. Appending only after Parsed
+	// succeeds ensures malformed or anonymous NTLM material cannot enter
+	// the replay/evidence state. A failed validation leaves existing pairs
+	// untouched.
+	data, err := pair.Parsed()
+	if err != nil {
+		return
+	}
+
+	s.Pairs = append(s.Pairs, pair)
+	if cb != nil {
+		cb(data)
 	}
 }
 
@@ -119,22 +133,58 @@ func NewNTLMState() *NTLMState {
 	}
 }
 
-func (sr NTLMChallengeResponse) getServerChallenge() string {
-	dataCallenge := sr.getChallengeBytes()
-	if len(dataCallenge) < NTLM_TYPE2_CHALLENGE_OFFSET+8 {
-		return ""
+var (
+	ErrInvalidNTLMChallenge   = errors.New("invalid NTLM challenge")
+	ErrInvalidNTLMResponse    = errors.New("invalid NTLM response")
+	ErrIncompleteNTLMIdentity = errors.New("incomplete NTLM identity")
+)
+
+func (sr NTLMChallengeResponse) decodeChallenge() ([]byte, error) {
+	dataChallenge, err := base64.StdEncoding.DecodeString(sr.Challenge)
+	if err != nil {
+		return nil, fmt.Errorf("%w: malformed base64: %v", ErrInvalidNTLMChallenge, err)
 	}
-	return hex.EncodeToString(dataCallenge[NTLM_TYPE2_CHALLENGE_OFFSET : NTLM_TYPE2_CHALLENGE_OFFSET+8])
+	if len(dataChallenge) < NTLM_TYPE2_CHALLENGE_OFFSET+8 {
+		return nil, fmt.Errorf("%w: message is too short", ErrInvalidNTLMChallenge)
+	}
+	if string(dataChallenge[:len(ntlmSignature)]) != ntlmSignature {
+		return nil, fmt.Errorf("%w: bad signature", ErrInvalidNTLMChallenge)
+	}
+	if messageType := binary.LittleEndian.Uint32(dataChallenge[NTLM_TYPE_OFFSET : NTLM_TYPE_OFFSET+4]); messageType != 2 {
+		return nil, fmt.Errorf("%w: unexpected message type %d", ErrInvalidNTLMChallenge, messageType)
+	}
+	return dataChallenge, nil
 }
 
 func (sr NTLMChallengeResponse) getChallengeBytes() []byte {
-	dataCallenge, _ := base64.StdEncoding.DecodeString(sr.Challenge)
-	return dataCallenge
+	dataChallenge, _ := sr.decodeChallenge()
+	return dataChallenge
+}
+
+func (sr NTLMChallengeResponse) getServerChallenge() string {
+	challenge, _ := sr.serverChallenge()
+	return challenge
+}
+
+func (sr NTLMChallengeResponse) serverChallenge() (string, error) {
+	dataChallenge, err := sr.decodeChallenge()
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(dataChallenge[NTLM_TYPE2_CHALLENGE_OFFSET : NTLM_TYPE2_CHALLENGE_OFFSET+8]), nil
 }
 
 func (sr NTLMChallengeResponse) getResponseBytes() []byte {
 	dataResponse, _ := base64.StdEncoding.DecodeString(sr.Response)
 	return dataResponse
+}
+
+func (sr NTLMChallengeResponse) decodeResponse() ([]byte, error) {
+	dataResponse, err := base64.StdEncoding.DecodeString(sr.Response)
+	if err != nil {
+		return nil, fmt.Errorf("%w: malformed base64: %v", ErrInvalidNTLMResponse, err)
+	}
+	return dataResponse, nil
 }
 func (sr *NTLMChallengeResponse) Parsed() (NTLMChallengeResponseParsed, error) {
 	if sr.isNtlmV1() {
@@ -144,12 +194,15 @@ func (sr *NTLMChallengeResponse) Parsed() (NTLMChallengeResponseParsed, error) {
 }
 
 func (sr *NTLMChallengeResponse) ParsedNtLMv2() (NTLMChallengeResponseParsed, error) {
-	r := sr.getResponseHeader()
+	r, b, err := sr.parsedResponseHeader()
+	if err != nil {
+		return NTLMChallengeResponseParsed{}, err
+	}
 	if r.UserLen == 0 {
 		return NTLMChallengeResponseParsed{}, errors.New("No repsponse data")
 	}
-	b := sr.getResponseBytes()
 	if int(r.NtOffset)+int(r.NtLen) > len(b) ||
+		int(r.LmOffset)+int(r.LmLen) > len(b) ||
 		int(r.UserOffset)+int(r.UserLen) > len(b) ||
 		int(r.DomainOffset)+int(r.DomainLen) > len(b) {
 		return NTLMChallengeResponseParsed{}, errors.New("response too short")
@@ -158,14 +211,24 @@ func (sr *NTLMChallengeResponse) ParsedNtLMv2() (NTLMChallengeResponseParsed, er
 	if len(nthash) < 16 {
 		return NTLMChallengeResponseParsed{}, errors.New("NTLMv2 hash too short")
 	}
-	return NTLMChallengeResponseParsed{
+	serverChallenge, err := sr.serverChallenge()
+	if err != nil {
+		return NTLMChallengeResponseParsed{}, err
+	}
+	user := sanitizeNTLMString(b[r.UserOffset : r.UserOffset+r.UserLen])
+	domain := sanitizeNTLMString(b[r.DomainOffset : r.DomainOffset+r.DomainLen])
+	parsed := NTLMChallengeResponseParsed{
 		Type:            NtlmV2,
-		ServerChallenge: sr.getServerChallenge(),
-		User:            strings.Replace(string(b[r.UserOffset:r.UserOffset+r.UserLen]), "\x00", "", -1),
-		Domain:          strings.Replace(string(b[r.DomainOffset:r.DomainOffset+r.DomainLen]), "\x00", "", -1),
+		ServerChallenge: serverChallenge,
+		User:            user,
+		Domain:          domain,
 		NtHashOne:       hex.EncodeToString(nthash[:16]),
 		NtHashTwo:       hex.EncodeToString(nthash[16:]),
-	}, nil
+	}
+	if !parsed.hasCompleteIdentity() {
+		return NTLMChallengeResponseParsed{}, ErrIncompleteNTLMIdentity
+	}
+	return parsed, nil
 }
 
 func (sr NTLMChallengeResponse) isNtlmV1() bool {
@@ -174,54 +237,84 @@ func (sr NTLMChallengeResponse) isNtlmV1() bool {
 }
 
 func (sr NTLMChallengeResponse) ParsedNtLMv1() (NTLMChallengeResponseParsed, error) {
-	r := sr.getResponseHeader()
+	r, b, err := sr.parsedResponseHeader()
+	if err != nil {
+		return NTLMChallengeResponseParsed{}, err
+	}
 	if r.UserLen == 0 {
 		return NTLMChallengeResponseParsed{}, errors.New("No repsponse data")
 	}
-	b := sr.getResponseBytes()
 	if int(r.UserOffset)+int(r.UserLen) > len(b) ||
 		int(r.DomainOffset)+int(r.DomainLen) > len(b) ||
-		int(r.LmOffset)+int(r.LmLen) > len(b) {
+		int(r.LmOffset)+int(r.LmLen) > len(b) ||
+		int(r.NtOffset)+int(r.NtLen) > len(b) {
 		return NTLMChallengeResponseParsed{}, errors.New("response too short")
 	}
-	return NTLMChallengeResponseParsed{
+	serverChallenge, err := sr.serverChallenge()
+	if err != nil {
+		return NTLMChallengeResponseParsed{}, err
+	}
+	user := sanitizeNTLMString(b[r.UserOffset : r.UserOffset+r.UserLen])
+	domain := sanitizeNTLMString(b[r.DomainOffset : r.DomainOffset+r.DomainLen])
+	parsed := NTLMChallengeResponseParsed{
 		Type:            NtlmV1,
-		ServerChallenge: sr.getServerChallenge(),
-		User:            strings.Replace(string(b[r.UserOffset:r.UserOffset+r.UserLen]), "\x00", "", -1),
-		Domain:          strings.Replace(string(b[r.DomainOffset:r.DomainOffset+r.DomainLen]), "\x00", "", -1),
+		ServerChallenge: serverChallenge,
+		User:            user,
+		Domain:          domain,
 		LmHash:          hex.EncodeToString(b[r.LmOffset : r.LmOffset+r.LmLen]),
-	}, nil
+	}
+	if !parsed.hasCompleteIdentity() {
+		return NTLMChallengeResponseParsed{}, ErrIncompleteNTLMIdentity
+	}
+	return parsed, nil
 }
 
-func is_le() bool {
-	var i int32 = 0x01020304
-	u := unsafe.Pointer(&i)
-	pb := (*byte)(u)
-	b := *pb
-	return (b == 0x04)
+func sanitizeNTLMString(b []byte) string {
+	return strings.ReplaceAll(string(b), "\x00", "")
+}
+
+func (d NTLMChallengeResponseParsed) hasCompleteIdentity() bool {
+	if d.User == "" || d.ServerChallenge == "" {
+		return false
+	}
+	if d.Domain != "" {
+		return true
+	}
+	// UPN and down-level qualified names carry the authority in User even
+	// when the Type 3 DomainName field is empty.
+	return strings.ContainsAny(d.User, `@\`)
 }
 
 func _uint32(b []byte, start, end int) uint32 {
-	if is_le() {
-		return binary.LittleEndian.Uint32(b[start:end])
-	}
-	return binary.BigEndian.Uint32(b[start:end])
+	return binary.LittleEndian.Uint32(b[start:end])
 }
 
 func _uint16(b []byte, start, end int) uint16 {
-	if is_le() {
-		return binary.LittleEndian.Uint16(b[start:end])
-	}
-	return binary.BigEndian.Uint16(b[start:end])
+	return binary.LittleEndian.Uint16(b[start:end])
 }
 
 func (sr NTLMChallengeResponse) getResponseHeader() NTLMResponseHeader {
-	b := sr.getResponseBytes()
-	if len(b) < NTLM_TYPE3_WORKSTN_OFFSET+6 {
-		return NTLMResponseHeader{}
+	header, _, _ := sr.parsedResponseHeader()
+	return header
+}
+
+func (sr NTLMChallengeResponse) parsedResponseHeader() (NTLMResponseHeader, []byte, error) {
+	b, err := sr.decodeResponse()
+	if err != nil {
+		return NTLMResponseHeader{}, nil, err
 	}
-	return NTLMResponseHeader{
-		Sig:          strings.Replace(string(b[NTLM_SIG_OFFSET:NTLM_SIG_OFFSET+8]), "\x00", "", -1),
+	if len(b) < NTLM_TYPE3_WORKSTN_OFFSET+6 {
+		err := fmt.Errorf("%w: header is too short", ErrInvalidNTLMResponse)
+		return NTLMResponseHeader{}, nil, err
+	}
+	if string(b[:len(ntlmSignature)]) != ntlmSignature {
+		return NTLMResponseHeader{}, nil, fmt.Errorf("%w: bad signature", ErrInvalidNTLMResponse)
+	}
+	if messageType := _uint32(b, NTLM_TYPE_OFFSET, NTLM_TYPE_OFFSET+4); messageType != 3 {
+		return NTLMResponseHeader{}, nil, fmt.Errorf("%w: unexpected message type %d", ErrInvalidNTLMResponse, messageType)
+	}
+	header := NTLMResponseHeader{
+		Sig:          sanitizeNTLMString(b[NTLM_SIG_OFFSET : NTLM_SIG_OFFSET+8]),
 		Type:         _uint32(b, NTLM_TYPE_OFFSET, NTLM_TYPE_OFFSET+4),
 		LmLen:        _uint16(b, NTLM_TYPE3_LMRESP_OFFSET, NTLM_TYPE3_LMRESP_OFFSET+2),
 		LmMax:        _uint16(b, NTLM_TYPE3_LMRESP_OFFSET+2, NTLM_TYPE3_LMRESP_OFFSET+4),
@@ -239,6 +332,7 @@ func (sr NTLMChallengeResponse) getResponseHeader() NTLMResponseHeader {
 		HostMax:      _uint16(b, NTLM_TYPE3_WORKSTN_OFFSET+2, NTLM_TYPE3_WORKSTN_OFFSET+4),
 		HostOffset:   _uint16(b, NTLM_TYPE3_WORKSTN_OFFSET+4, NTLM_TYPE3_WORKSTN_OFFSET+6),
 	}
+	return header, b, nil
 }
 
 func (data NTLMChallengeResponseParsed) LcString() string {
