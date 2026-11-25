@@ -152,8 +152,16 @@ func (s *SSLStripper) Preprocess(req *http.Request, ctx *goproxy.ProxyCtx) (redi
 		// check if we need to redirect the user in order
 		// to make unknown session cookies expire
 		log.Info("[%s] Sending expired cookies for %s to %s", tui.Green("sslstrip"), tui.Yellow(req.Host), req.RemoteAddr)
+		var err error
+		redir, err = s.cookies.expire(req)
+		if err != nil {
+			// Do not mark this client/origin as cleaned: the expiry response
+			// could not be safely bound to a real domain. Leaving the tracker
+			// unknown allows a later valid request to retry cleanup.
+			log.Warning("[%s] Cannot expire cookies for %s: %v", tui.Green("sslstrip"), tui.Yellow(req.Host), err)
+			return nil
+		}
 		s.cookies.Track(req)
-		redir = s.cookies.Expire(req)
 	}
 
 	return
