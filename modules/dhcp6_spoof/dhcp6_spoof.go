@@ -114,7 +114,16 @@ func (mod *DHCP6Spoofer) Configure() error {
 }
 
 func (mod *DHCP6Spoofer) dhcp6For(what dhcp6.MessageType, to dhcp6.Packet) (err error, p dhcp6.Packet) {
-	err, p = packets.DHCP6For(what, to, mod.DUIDRaw)
+	// The ClientID in the request is the client's identity.  It has to be
+	// kept separate from our own server DUID, otherwise a response can be
+	// addressed to the request sender while carrying another client's
+	// identity.
+	clientDUID, err := packets.DHCP6ClientID(to)
+	if err != nil {
+		return err, dhcp6.Packet{}
+	}
+
+	err, p = packets.DHCP6ForClient(what, to, clientDUID, mod.DUIDRaw)
 	if err != nil {
 		return
 	}
@@ -132,8 +141,6 @@ func (mod *DHCP6Spoofer) dhcpAdvertise(pkt gopacket.Packet, solicit dhcp6.Packet
 	if raw, found := solicit.Options[packets.DHCP6OptClientFQDN]; found && len(raw) >= 1 {
 		fqdn = string(raw[0])
 	}
-
-	mod.Info("Got DHCPv6 Solicit request from %s (%s), sending spoofed advertisement for %d domains.", tui.Bold(fqdn), target, len(mod.Domains))
 
 	err, adv := mod.dhcp6For(dhcp6.MessageTypeAdvertise, solicit)
 	if err != nil {
@@ -223,12 +230,13 @@ func (mod *DHCP6Spoofer) dhcpAdvertise(pkt gopacket.Packet, solicit dhcp6.Packet
 	mod.Debug("Sending %d bytes of packet ...", len(raw))
 	if err := mod.Session.Queue.Send(raw); err != nil {
 		mod.Error("Error sending packet: %s", err)
+		return
 	}
+
+	mod.Info("Got DHCPv6 Solicit request from %s (%s), sent spoofed advertisement for %d domains.", tui.Bold(fqdn), target, len(mod.Domains))
 }
 
 func (mod *DHCP6Spoofer) dhcpReply(toType string, pkt gopacket.Packet, req dhcp6.Packet, target net.HardwareAddr) {
-	mod.Debug("Sending spoofed DHCPv6 reply to %s after its %s packet.", tui.Bold(target.String()), toType)
-
 	err, reply := mod.dhcp6For(dhcp6.MessageTypeReply, req)
 	if err != nil {
 		mod.Error("%s", err)
@@ -302,7 +310,10 @@ func (mod *DHCP6Spoofer) dhcpReply(toType string, pkt gopacket.Packet, req dhcp6
 	mod.Debug("Sending %d bytes of packet ...", len(raw))
 	if err := mod.Session.Queue.Send(raw); err != nil {
 		mod.Error("Error sending packet: %s", err)
+		return
 	}
+
+	mod.Debug("Sent spoofed DHCPv6 reply to %s after its %s packet.", tui.Bold(target.String()), toType)
 
 	if toType == "request" {
 		var addr net.IP
